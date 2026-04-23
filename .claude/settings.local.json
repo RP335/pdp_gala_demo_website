@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check app.js)",
+      "Bash(python3 *)",
+      "Bash(curl -s -o /dev/null -w \"HTML: %{http_code} %{size_download}B\\\\n\" http://localhost:8765/)",
+      "Bash(curl -s -o /dev/null -w \"CSS: %{http_code} %{size_download}B\\\\n\" http://localhost:8765/style.css)",
+      "Bash(curl -s -o /dev/null -w \"JS: %{http_code} %{size_download}B\\\\n\" http://localhost:8765/app.js)",
+      "Bash(curl -s -o /dev/null -w \"Missing WAV: %{http_code}\\\\n\" http://localhost:8765/audio/male.wav)"
+    ]
+  }
+}

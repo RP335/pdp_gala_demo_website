@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hearing Loss Simulator — Aalto PdP</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <h1>Hearing Loss Simulator</h1>
+      <p class="subtitle">
+        Why first responders struggle to hear commands through their duty
+        headsets — and why conventional hearing aids aren't an option.
+      </p>
+    </div>
+    <div class="project-tag">Aalto PdP · Demo</div>
+  </header>
+
+  <main>
+    <section class="stage-panel">
+      <div class="stage-meta">
+        <span class="voice-label" id="voiceLabel">—</span>
+        <span class="profile-label" id="profileLabel">Press play to begin</span>
+      </div>
+
+      <p class="transcript" id="transcript">
+        This is a real-time simulation of how speech sounds to a listener with
+        different degrees of hearing loss. The same voice recording is played
+        through filters that match clinical audiogram profiles. Click
+        <strong>Run full demo</strong> to start.
+      </p>
+
+      <div class="progress">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+
+      <div class="stage-dots" id="stageDots"></div>
+    </section>
+
+    <section class="viz-panel">
+      <div class="viz-card">
+        <h2>Audiogram</h2>
+        <p class="viz-note">
+          Hearing threshold in dB HL per ear. Lower line = better hearing.
+          Red = right ear, blue = left ear.
+        </p>
+        <canvas id="audiogram" width="560" height="360"></canvas>
+      </div>
+
+      <div class="viz-card">
+        <h2>Applied EQ (per ear)</h2>
+        <p class="viz-note">
+          Attenuation curve being applied to the voice in real time.
+          Mirrors the audiogram.
+        </p>
+        <canvas id="eqcurve" width="560" height="220"></canvas>
+      </div>
+    </section>
+
+    <section class="controls">
+      <div class="row primary-row">
+        <button id="playBtn" class="primary">▶ Run full demo</button>
+        <button id="pauseBtn">⏸ Pause</button>
+        <button id="stopBtn">■ Stop</button>
+      </div>
+
+      <div class="row">
+        <div class="jump-group">
+          <div class="jump-label">Male voice</div>
+          <button data-stage="0">Normal</button>
+          <button data-stage="1">Moderate</button>
+          <button data-stage="2">Severe</button>
+          <button data-stage="3">Asymmetric</button>
+        </div>
+        <div class="jump-group">
+          <div class="jump-label">Female voice</div>
+          <button data-stage="4">Normal</button>
+          <button data-stage="5">Moderate</button>
+          <button data-stage="6">Severe</button>
+          <button data-stage="7">Asymmetric</button>
+        </div>
+      </div>
+
+      <div class="row sliders">
+        <label>
+          Speech <input type="range" id="speechGain" min="0" max="1" step="0.01" value="0.9" />
+        </label>
+        <label>
+          Noise <input type="range" id="noiseGain" min="0" max="1" step="0.01" value="0.25" />
+        </label>
+        <label>
+          Master <input type="range" id="masterGain" min="0" max="1" step="0.01" value="0.8" />
+        </label>
+      </div>
+
+      <div class="row status-row">
+        <span id="audioStatus" class="status">Audio: not loaded</span>
+      </div>
+    </section>
+
+    <section class="explainer">
+      <h2>What's going on</h2>
+      <p>
+        Each stage plays the same voice recording through a chain of eleven
+        peaking filters centered at the standard audiogram frequencies
+        (125, 250, 500, 750, 1k, 1.5k, 2k, 3k, 4k, 6k, 8k Hz). Each filter's
+        attenuation matches the hearing-loss profile for that ear, so the
+        simulation is <em>stereo</em>: if the left ear has more loss than the
+        right, you'll hear it. A low level of pink noise is mixed in to
+        imitate the noisy environments first responders actually work in.
+      </p>
+      <p>
+        Real hearing loss is more than spectral attenuation — it also
+        involves temporal processing, recruitment, and cognitive load. This
+        demo captures the <em>loudness and spectral</em> side only. It's
+        meant to communicate the problem, not to substitute for a clinical
+        test.
+      </p>
+      <p class="caveat">
+        Listen through headphones for the asymmetric profile to be audible.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Aalto University · Product Development Project · Hearing-aid algorithms
+      for first responders in high-noise environments.
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,679 @@
+// Hearing Loss Simulator — Aalto PdP
+// Plain-JS / Web Audio API. No build step. Hostable on GitHub Pages.
+
+// ============================================================
+// 1. Audiogram profiles (dB HL per band, per ear)
+// ============================================================
+
+const FREQS = [125, 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000];
+
+// Hearing-loss profiles. Values are dB HL (positive = more loss).
+// Symmetric profiles have L == R. Asymmetric mirrors real noise-induced loss
+// from e.g. firearms training: one ear clearly worse than the other.
+const PROFILES = {
+  normal: {
+    label: "Normal hearing",
+    L: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    R: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  },
+  moderate: {
+    label: "Moderate loss",
+    L: [0, 0, 10, 15, 20, 25, 30, 30, 40, 30, 20],
+    R: [0, 0, 10, 15, 20, 25, 30, 30, 40, 30, 20],
+  },
+  severe: {
+    label: "Severe loss",
+    L: [10, 10, 20, 20, 20, 30, 40, 50, 55, 60, 60],
+    R: [10, 10, 20, 20, 20, 30, 40, 50, 55, 60, 60],
+  },
+  asymmetric: {
+    label: "Asymmetric loss (right worse)",
+    L: [0, 0, 5, 10, 15, 20, 25, 25, 30, 25, 20],
+    R: [10, 10, 20, 20, 25, 35, 45, 55, 60, 60, 60],
+  },
+};
+
+// ============================================================
+// 2. Demo script + stages
+// ============================================================
+
+const TRANSCRIPTS = {
+  male:
+    "You will now hear me speaking while background noise is mixed in. " +
+    "Depending on the hearing profile, my voice will sound clear, muffled, " +
+    "or mostly unintelligible. This is roughly what a police officer or " +
+    "firefighter hears when a command comes over their headset in the field.",
+  female:
+    "Hearing loss is common among first responders because of years of " +
+    "exposure to sirens, engines, and gunfire. Most do not wear hearing aids " +
+    "— conventional aids don't fit under duty headsets, and stigma keeps " +
+    "them away until the loss is severe. This demo shows why assistance " +
+    "inside the headset matters.",
+};
+
+const STAGES = [
+  { voice: "male",   profile: "normal",     durationSec: null },
+  { voice: "male",   profile: "moderate",   durationSec: null },
+  { voice: "male",   profile: "severe",     durationSec: null },
+  { voice: "male",   profile: "asymmetric", durationSec: null },
+  { voice: "female", profile: "normal",     durationSec: null },
+  { voice: "female", profile: "moderate",   durationSec: null },
+  { voice: "female", profile: "severe",     durationSec: null },
+  { voice: "female", profile: "asymmetric", durationSec: null },
+];
+
+// ============================================================
+// 3. Audio engine
+// ============================================================
+
+const AUDIO_PATHS = {
+  male: "audio/male.wav",
+  female: "audio/female.wav",
+  noise: "audio/noise.wav", // optional; falls back to generated pink noise
+};
+
+const PEAKING_Q = 1.4;
+
+class Engine {
+  constructor() {
+    this.ctx = null;
+    this.buffers = { male: null, female: null, noise: null };
+    this.speechSource = null;
+    this.noiseSource = null;
+    this.speechGain = null;
+    this.noiseGain = null;
+    this.masterGain = null;
+    this.splitter = null;
+    this.merger = null;
+    this.filtersL = [];
+    this.filtersR = [];
+    this.activeProfile = PROFILES.normal;
+    this.playing = false;
+    this.currentVoice = null;
+    this.onEnded = null;
+  }
+
+  async init() {
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // One peaking biquad per band, per ear. All chained in series per side.
+    const makeChain = (bands) => {
+      const chain = [];
+      for (const f of FREQS) {
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = "peaking";
+        filter.frequency.value = f;
+        filter.Q.value = PEAKING_Q;
+        filter.gain.value = 0;
+        chain.push(filter);
+      }
+      // series wiring
+      for (let i = 0; i < chain.length - 1; i++) chain[i].connect(chain[i + 1]);
+      return chain;
+    };
+
+    this.filtersL = makeChain();
+    this.filtersR = makeChain();
+
+    // Mixer gains forced to stereo with "speakers" interpretation so that
+    // mono WAVs get duplicated to L+R before the per-ear split. Otherwise
+    // a mono input would leave the right channel silent.
+    const stereoGain = (v) => {
+      const g = this.ctx.createGain();
+      g.gain.value = v;
+      g.channelCount = 2;
+      g.channelCountMode = "explicit";
+      g.channelInterpretation = "speakers";
+      return g;
+    };
+
+    this.speechGain = stereoGain(0.9);
+    this.noiseGain = stereoGain(0.25);
+    this.masterGain = this.ctx.createGain();
+    this.masterGain.gain.value = 0.8;
+
+    // Mix speech + noise, then split to per-ear chains, then merge.
+    this.splitter = this.ctx.createChannelSplitter(2);
+    this.merger = this.ctx.createChannelMerger(2);
+
+    this.speechGain.connect(this.splitter);
+    this.noiseGain.connect(this.splitter);
+
+    this.splitter.connect(this.filtersL[0], 0);
+    this.splitter.connect(this.filtersR[0], 1);
+
+    this.filtersL[this.filtersL.length - 1].connect(this.merger, 0, 0);
+    this.filtersR[this.filtersR.length - 1].connect(this.merger, 0, 1);
+
+    this.merger.connect(this.masterGain);
+    this.masterGain.connect(this.ctx.destination);
+  }
+
+  async loadBuffers(statusEl) {
+    const results = { male: false, female: false, noise: false };
+
+    const tryLoad = async (key) => {
+      try {
+        const res = await fetch(AUDIO_PATHS[key]);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const arr = await res.arrayBuffer();
+        const buf = await this.ctx.decodeAudioData(arr);
+        this.buffers[key] = buf;
+        results[key] = true;
+      } catch (e) {
+        this.buffers[key] = null;
+        results[key] = false;
+      }
+    };
+
+    await Promise.all([tryLoad("male"), tryLoad("female"), tryLoad("noise")]);
+
+    // Fallback: generate pink noise if noise.wav is absent.
+    if (!this.buffers.noise) {
+      this.buffers.noise = this._generatePinkNoise(6);
+    }
+    return results;
+  }
+
+  _generatePinkNoise(durationSec) {
+    const sampleRate = this.ctx.sampleRate;
+    const length = sampleRate * durationSec;
+    const buffer = this.ctx.createBuffer(2, length, sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buffer.getChannelData(ch);
+      // Paul Kellet's economy pink-noise filter
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+      for (let i = 0; i < length; i++) {
+        const white = Math.random() * 2 - 1;
+        b0 = 0.99886 * b0 + white * 0.0555179;
+        b1 = 0.99332 * b1 + white * 0.0750759;
+        b2 = 0.96900 * b2 + white * 0.1538520;
+        b3 = 0.86650 * b3 + white * 0.3104856;
+        b4 = 0.55000 * b4 + white * 0.5329522;
+        b5 = -0.7616 * b5 - white * 0.0168980;
+        data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11;
+        b6 = white * 0.115926;
+      }
+    }
+    return buffer;
+  }
+
+  applyProfile(profile) {
+    this.activeProfile = profile;
+    for (let i = 0; i < FREQS.length; i++) {
+      // Apply -dB on the filter: hearing loss of N dB → cut N dB at that band
+      const t = this.ctx.currentTime;
+      this.filtersL[i].gain.setTargetAtTime(-profile.L[i], t, 0.03);
+      this.filtersR[i].gain.setTargetAtTime(-profile.R[i], t, 0.03);
+    }
+  }
+
+  playStage(voice, profile, onEnded) {
+    if (!this.buffers[voice]) {
+      onEnded && onEnded({ reason: "missing" });
+      return null;
+    }
+    this.stop(); // stop any existing source
+    this.applyProfile(profile);
+    this.currentVoice = voice;
+    this.onEnded = onEnded;
+
+    // Speech
+    this.speechSource = this.ctx.createBufferSource();
+    this.speechSource.buffer = this.buffers[voice];
+    this.speechSource.connect(this.speechGain);
+
+    // Noise (loops under the speech)
+    this.noiseSource = this.ctx.createBufferSource();
+    this.noiseSource.buffer = this.buffers.noise;
+    this.noiseSource.loop = true;
+    this.noiseSource.connect(this.noiseGain);
+
+    // End of speech = end of stage; noise stops with it.
+    this.speechSource.onended = () => {
+      if (!this.playing) return; // already stopped externally
+      this.playing = false;
+      try { this.noiseSource.stop(); } catch (_) {}
+      const cb = this.onEnded;
+      this.onEnded = null;
+      cb && cb({ reason: "complete" });
+    };
+
+    const t = this.ctx.currentTime + 0.05;
+    this.speechSource.start(t);
+    this.noiseSource.start(t);
+    this.playing = true;
+    return this.buffers[voice].duration;
+  }
+
+  stop() {
+    this.playing = false;
+    try { if (this.speechSource) this.speechSource.stop(); } catch (_) {}
+    try { if (this.noiseSource) this.noiseSource.stop(); } catch (_) {}
+    this.speechSource = null;
+    this.noiseSource = null;
+  }
+
+  setSpeechGain(v) { this.speechGain && (this.speechGain.gain.value = v); }
+  setNoiseGain(v)  { this.noiseGain  && (this.noiseGain.gain.value  = v); }
+  setMasterGain(v) { this.masterGain && (this.masterGain.gain.value = v); }
+
+  resume() { return this.ctx.resume(); }
+  suspend() { return this.ctx.suspend(); }
+}
+
+// ============================================================
+// 4. Audiogram + EQ curve drawing
+// ============================================================
+
+function drawAudiogram(canvas, profile) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 50, padR = 20, padT = 20, padB = 36;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  const minF = Math.log2(125);
+  const maxF = Math.log2(8000);
+  const xFor = (f) => padL + ((Math.log2(f) - minF) / (maxF - minF)) * plotW;
+
+  const dbMin = -10;
+  const dbMax = 80;
+  const yFor = (db) => padT + ((db - dbMin) / (dbMax - dbMin)) * plotH;
+
+  // dB severity bands (matches the reference audiogram shading)
+  const bands = [
+    { from: -10, to: 25, color: "#e6f4ea" }, // normal
+    { from: 25,  to: 40, color: "#e8f0fe" }, // mild
+    { from: 40,  to: 55, color: "#eae6f7" }, // moderate
+    { from: 55,  to: 70, color: "#fff4e5" }, // moderately severe
+    { from: 70,  to: 80, color: "#fde8e8" }, // severe
+  ];
+  for (const b of bands) {
+    ctx.fillStyle = b.color;
+    ctx.fillRect(padL, yFor(b.from), plotW, yFor(b.to) - yFor(b.from));
+  }
+
+  // grid
+  ctx.strokeStyle = "#c9ced8";
+  ctx.lineWidth = 1;
+  ctx.font = "12px ui-sans-serif, system-ui";
+  ctx.fillStyle = "#444";
+
+  // horizontal (dB) grid
+  for (let db = 0; db <= 80; db += 10) {
+    const y = yFor(db);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.strokeStyle = db === 0 ? "#888" : "#d8dce3";
+    ctx.stroke();
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(db), padL - 6, y);
+  }
+
+  // vertical (freq) grid
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (const f of FREQS) {
+    const x = xFor(f);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.strokeStyle = "#e1e5ec";
+    ctx.stroke();
+    const label = f >= 1000 ? (f / 1000) + "k" : String(f);
+    ctx.fillStyle = "#444";
+    ctx.fillText(label, x, padT + plotH + 6);
+  }
+
+  // frame
+  ctx.strokeStyle = "#9aa3b2";
+  ctx.strokeRect(padL, padT, plotW, plotH);
+
+  // Axis titles
+  ctx.save();
+  ctx.translate(14, padT + plotH / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#333";
+  ctx.fillText("Hearing level (dB HL)", 0, 0);
+  ctx.restore();
+
+  ctx.fillStyle = "#333";
+  ctx.textAlign = "center";
+  ctx.fillText("Frequency (Hz)", padL + plotW / 2, cssH - 6);
+
+  // plot left (blue X) and right (red O)
+  const plotSeries = (values, color, marker) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]);
+      const y = yFor(db);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]);
+      const y = yFor(db);
+      if (marker === "x") {
+        ctx.beginPath();
+        ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6);
+        ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    });
+  };
+
+  plotSeries(profile.L, "#2b6cff", "x");
+  plotSeries(profile.R, "#e0334c", "o");
+
+  // legend
+  ctx.font = "12px ui-sans-serif, system-ui";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  const lx = padL + 8;
+  const ly = padT + 10;
+  ctx.fillStyle = "#e0334c"; ctx.beginPath(); ctx.arc(lx + 4, ly, 5, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = "#333"; ctx.fillText("Right ear (O)", lx + 16, ly);
+  ctx.fillStyle = "#2b6cff";
+  const lx2 = lx + 110;
+  ctx.beginPath();
+  ctx.moveTo(lx2 - 2, ly - 5); ctx.lineTo(lx2 + 10, ly + 5);
+  ctx.moveTo(lx2 + 10, ly - 5); ctx.lineTo(lx2 - 2, ly + 5);
+  ctx.stroke();
+  ctx.fillStyle = "#333"; ctx.fillText("Left ear (X)", lx2 + 16, ly);
+}
+
+function drawEqCurve(canvas, profile) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 50, padR = 20, padT = 16, padB = 30;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  const minF = Math.log2(125);
+  const maxF = Math.log2(8000);
+  const xFor = (f) => padL + ((Math.log2(f) - minF) / (maxF - minF)) * plotW;
+
+  const dbMin = -70, dbMax = 10;
+  const yFor = (db) => padT + ((dbMax - db) / (dbMax - dbMin)) * plotH;
+
+  ctx.fillStyle = "#f7f8fa";
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  // grid
+  ctx.strokeStyle = "#d8dce3";
+  ctx.fillStyle = "#444";
+  ctx.font = "11px ui-sans-serif, system-ui";
+  for (let db = -60; db <= 0; db += 20) {
+    const y = yFor(db);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y);
+    ctx.strokeStyle = db === 0 ? "#888" : "#d8dce3";
+    ctx.stroke();
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(String(db), padL - 6, y);
+  }
+
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const f of FREQS) {
+    const x = xFor(f);
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH);
+    ctx.strokeStyle = "#e1e5ec";
+    ctx.stroke();
+    const label = f >= 1000 ? (f / 1000) + "k" : String(f);
+    ctx.fillStyle = "#444";
+    ctx.fillText(label, x, padT + plotH + 4);
+  }
+
+  ctx.strokeStyle = "#9aa3b2";
+  ctx.strokeRect(padL, padT, plotW, plotH);
+
+  const plotGain = (values, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]);
+      const y = yFor(-db); // applied gain is -db
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = color;
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]);
+      const y = yFor(-db);
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+    });
+  };
+
+  plotGain(profile.L, "#2b6cff");
+  plotGain(profile.R, "#e0334c");
+}
+
+// ============================================================
+// 5. UI / state machine
+// ============================================================
+
+const els = {
+  voiceLabel: document.getElementById("voiceLabel"),
+  profileLabel: document.getElementById("profileLabel"),
+  transcript: document.getElementById("transcript"),
+  progressFill: document.getElementById("progressFill"),
+  stageDots: document.getElementById("stageDots"),
+  audiogram: document.getElementById("audiogram"),
+  eqcurve: document.getElementById("eqcurve"),
+  playBtn: document.getElementById("playBtn"),
+  pauseBtn: document.getElementById("pauseBtn"),
+  stopBtn: document.getElementById("stopBtn"),
+  speechGain: document.getElementById("speechGain"),
+  noiseGain: document.getElementById("noiseGain"),
+  masterGain: document.getElementById("masterGain"),
+  audioStatus: document.getElementById("audioStatus"),
+};
+
+const engine = new Engine();
+let stageIdx = -1;
+let running = false;          // "auto-advance through all stages"
+let progressTimer = null;
+let stageStartTime = 0;
+let stageDuration = 0;
+
+function buildDots() {
+  els.stageDots.innerHTML = "";
+  STAGES.forEach((_, i) => {
+    const d = document.createElement("div");
+    d.className = "dot";
+    d.title = `${STAGES[i].voice} · ${PROFILES[STAGES[i].profile].label}`;
+    els.stageDots.appendChild(d);
+  });
+}
+
+function updateDots() {
+  [...els.stageDots.children].forEach((d, i) => {
+    d.classList.toggle("current", i === stageIdx);
+    d.classList.toggle("done", i < stageIdx);
+  });
+}
+
+function updateStageUi(stage) {
+  const profile = PROFILES[stage.profile];
+  els.voiceLabel.textContent =
+    (stage.voice === "male" ? "Male voice" : "Female voice");
+  els.profileLabel.textContent = profile.label;
+  els.transcript.textContent = TRANSCRIPTS[stage.voice];
+  drawAudiogram(els.audiogram, profile);
+  drawEqCurve(els.eqcurve, profile);
+  updateDots();
+}
+
+function setStatus(text, cls) {
+  els.audioStatus.textContent = text;
+  els.audioStatus.className = "status" + (cls ? " " + cls : "");
+}
+
+function startProgress(duration) {
+  stopProgress();
+  stageStartTime = performance.now();
+  stageDuration = duration * 1000;
+  progressTimer = setInterval(() => {
+    const pct = Math.min(
+      100,
+      ((performance.now() - stageStartTime) / stageDuration) * 100
+    );
+    els.progressFill.style.width = pct + "%";
+  }, 80);
+}
+
+function stopProgress() {
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+
+async function runStage(idx, { autoAdvance }) {
+  if (idx < 0 || idx >= STAGES.length) return;
+  stageIdx = idx;
+  const stage = STAGES[idx];
+  updateStageUi(stage);
+
+  await engine.resume();
+
+  const duration = engine.playStage(stage.voice, PROFILES[stage.profile], (info) => {
+    stopProgress();
+    els.progressFill.style.width = "100%";
+    if (info.reason === "missing") {
+      setStatus(
+        `Audio file not found: audio/${stage.voice}.wav — drop in a WAV to play this voice.`,
+        "warn"
+      );
+      if (autoAdvance && running) {
+        // Skip missing voice and keep going
+        setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 200);
+      }
+      return;
+    }
+    if (autoAdvance && running && idx + 1 < STAGES.length) {
+      setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 400);
+    } else if (idx + 1 >= STAGES.length) {
+      running = false;
+      els.playBtn.textContent = "▶ Run full demo";
+    }
+  });
+
+  if (duration) startProgress(duration);
+}
+
+function bindUi() {
+  els.playBtn.addEventListener("click", async () => {
+    if (running) {
+      // pause-like: stop the loop
+      running = false;
+      engine.stop();
+      stopProgress();
+      els.playBtn.textContent = "▶ Run full demo";
+      return;
+    }
+    running = true;
+    els.playBtn.textContent = "⏸ Stop demo";
+    const startAt = stageIdx >= 0 && stageIdx < STAGES.length - 1 ? 0 : 0;
+    runStage(startAt, { autoAdvance: true });
+  });
+
+  els.pauseBtn.addEventListener("click", async () => {
+    if (!engine.ctx) return;
+    if (engine.ctx.state === "running") {
+      await engine.suspend();
+      els.pauseBtn.textContent = "▶ Resume";
+    } else {
+      await engine.resume();
+      els.pauseBtn.textContent = "⏸ Pause";
+    }
+  });
+
+  els.stopBtn.addEventListener("click", () => {
+    running = false;
+    engine.stop();
+    stopProgress();
+    els.progressFill.style.width = "0%";
+    els.playBtn.textContent = "▶ Run full demo";
+  });
+
+  document.querySelectorAll("button[data-stage]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      running = false;
+      els.playBtn.textContent = "▶ Run full demo";
+      const idx = parseInt(b.dataset.stage, 10);
+      runStage(idx, { autoAdvance: false });
+    });
+  });
+
+  els.speechGain.addEventListener("input", (e) =>
+    engine.setSpeechGain(parseFloat(e.target.value))
+  );
+  els.noiseGain.addEventListener("input", (e) =>
+    engine.setNoiseGain(parseFloat(e.target.value))
+  );
+  els.masterGain.addEventListener("input", (e) =>
+    engine.setMasterGain(parseFloat(e.target.value))
+  );
+
+  window.addEventListener("resize", () => {
+    const profile = stageIdx >= 0 ? PROFILES[STAGES[stageIdx].profile] : PROFILES.normal;
+    drawAudiogram(els.audiogram, profile);
+    drawEqCurve(els.eqcurve, profile);
+  });
+}
+
+async function main() {
+  buildDots();
+  bindUi();
+  drawAudiogram(els.audiogram, PROFILES.normal);
+  drawEqCurve(els.eqcurve, PROFILES.normal);
+
+  await engine.init();
+  setStatus("Loading audio…", "warn");
+  const loaded = await engine.loadBuffers();
+
+  const missing = [];
+  if (!loaded.male) missing.push("audio/male.wav");
+  if (!loaded.female) missing.push("audio/female.wav");
+
+  if (missing.length === 0) {
+    setStatus("Audio: male + female ready · noise ready", "ok");
+  } else {
+    setStatus(
+      `Audio: missing ${missing.join(", ")} — drop WAV files in /audio/ and refresh.`,
+      "warn"
+    );
+  }
+}
+
+main();
