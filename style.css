@@ -259,6 +259,14 @@ button:disabled {
   width: 160px;
 }
 
+.sim-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+  font-size: 13px;
+  min-width: 3ch;
+  display: inline-block;
+}
+
 .status {
   color: var(--muted);
   font-size: 13px;

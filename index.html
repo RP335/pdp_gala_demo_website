@@ -93,6 +93,11 @@
         <label>
           Master <input type="range" id="masterGain" min="0" max="1" step="0.01" value="0.8" />
         </label>
+        <label title="Scales the applied attenuation — tune by ear against a reference.">
+          Sim intensity
+          <input type="range" id="simIntensity" min="0.2" max="1.2" step="0.05" value="0.55" />
+          <span id="simIntensityVal" class="sim-val">0.55</span>
+        </label>
       </div>
 
       <div class="row status-row">
@@ -105,18 +110,28 @@
       <p>
         Each stage plays the same voice recording through a chain of eleven
         peaking filters centered at the standard audiogram frequencies
-        (125, 250, 500, 750, 1k, 1.5k, 2k, 3k, 4k, 6k, 8k Hz). Each filter's
-        attenuation matches the hearing-loss profile for that ear, so the
-        simulation is <em>stereo</em>: if the left ear has more loss than the
-        right, you'll hear it. A low level of pink noise is mixed in to
-        imitate the noisy environments first responders actually work in.
+        (125, 250, 500, 750, 1k, 1.5k, 2k, 3k, 4k, 6k, 8k Hz), applied
+        independently per ear so the simulation is <em>stereo</em>: if the
+        left ear has more loss than the right, you'll hear it. A low level
+        of pink noise is mixed in to imitate the noisy environments first
+        responders actually work in.
       </p>
       <p>
-        Real hearing loss is more than spectral attenuation — it also
-        involves temporal processing, recruitment, and cognitive load. This
-        demo captures the <em>loudness and spectral</em> side only. It's
-        meant to communicate the problem, not to substitute for a clinical
-        test.
+        The audiogram shows <em>clinical dB HL</em> — a threshold
+        measurement. The EQ curve shows the <em>applied attenuation</em>,
+        which is always smaller. That's deliberate: dB HL tells you how
+        much louder a tone must be for the listener to first detect it; it
+        does not mean speech gets attenuated by that many decibels.
+        Conversational speech sits ~60 dB SPL, which is well above the
+        threshold even for moderate loss — the listener still hears it,
+        just with less headroom and reduced crispness.
+      </p>
+      <p>
+        The <em>Sim intensity</em> slider scales this sensation-level
+        mapping so the demo can be tuned by ear against a reference.
+        Real hearing loss also involves temporal processing, recruitment,
+        and cognitive load — none of which a pure EQ captures. This is a
+        <em>spectral/loudness</em> simulation only.
       </p>
       <p class="caveat">
         Listen through headphones for the asymmetric profile to be audible.

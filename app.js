@@ -72,7 +72,32 @@ const AUDIO_PATHS = {
   noise: "audio/noise.wav", // optional; falls back to generated pink noise
 };
 
-const PEAKING_Q = 1.4;
+// Lower Q → broader, smoother peaking filters with less cumulative overlap
+// between adjacent bands. 1.4 was too narrow+overlapping and piled up
+// attenuation in the 3–8 kHz region of the severe profile.
+const PEAKING_Q = 1.0;
+
+// dB HL on an audiogram is a *threshold* measurement, not a signal
+// attenuation. A listener with 40 dB HL at 4 kHz still hears conversational
+// speech at 4 kHz — it's just above their raised threshold by ~20 dB of
+// sensation level, not silent. Applying -loss_dB directly to the signal
+// over-attenuates drastically.
+//
+// This is a practical approximation of the sensation-level model:
+//   effective_cut = min(MAX, max(0, loss_dB - HEADROOM) * SCALE)
+// The HEADROOM accounts for speech sitting well above normal threshold;
+// SCALE compresses the residual loss into perceived attenuation; MAX caps
+// the per-band cut to avoid unstable filters and cumulative overlap.
+const SIM = {
+  headroomDb: 15,
+  scale: 0.55,
+  maxCutDb: 35,
+};
+
+function lossToCutDb(lossDb) {
+  const raw = Math.max(0, lossDb - SIM.headroomDb) * SIM.scale;
+  return Math.min(SIM.maxCutDb, raw);
+}
 
 class Engine {
   constructor() {
@@ -200,11 +225,14 @@ class Engine {
 
   applyProfile(profile) {
     this.activeProfile = profile;
+    const t = this.ctx.currentTime;
     for (let i = 0; i < FREQS.length; i++) {
-      // Apply -dB on the filter: hearing loss of N dB → cut N dB at that band
-      const t = this.ctx.currentTime;
-      this.filtersL[i].gain.setTargetAtTime(-profile.L[i], t, 0.03);
-      this.filtersR[i].gain.setTargetAtTime(-profile.R[i], t, 0.03);
+      // Map clinical dB HL → effective signal attenuation via the
+      // sensation-level approximation (see SIM constants / lossToCutDb).
+      const cutL = -lossToCutDb(profile.L[i]);
+      const cutR = -lossToCutDb(profile.R[i]);
+      this.filtersL[i].gain.setTargetAtTime(cutL, t, 0.03);
+      this.filtersR[i].gain.setTargetAtTime(cutR, t, 0.03);
     }
   }
 
@@ -458,26 +486,54 @@ function drawEqCurve(canvas, profile) {
   ctx.strokeStyle = "#9aa3b2";
   ctx.strokeRect(padL, padT, plotW, plotH);
 
-  const plotGain = (values, color) => {
+  const plotAppliedGain = (values, color) => {
     ctx.strokeStyle = color;
     ctx.lineWidth = 2.5;
     ctx.beginPath();
     values.forEach((db, i) => {
       const x = xFor(FREQS[i]);
-      const y = yFor(-db); // applied gain is -db
+      const y = yFor(-lossToCutDb(db)); // applied cut (sensation-level mapped)
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
     ctx.fillStyle = color;
     values.forEach((db, i) => {
       const x = xFor(FREQS[i]);
-      const y = yFor(-db);
+      const y = yFor(-lossToCutDb(db));
       ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
     });
   };
 
-  plotGain(profile.L, "#2b6cff");
-  plotGain(profile.R, "#e0334c");
+  // Ghost line: raw audiogram dB (for comparison — shows how much the
+  // sensation-level mapping compresses the clinical values).
+  const plotGhost = (values, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    ctx.globalAlpha = 0.4;
+    ctx.beginPath();
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]);
+      const y = yFor(-db);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  };
+
+  plotGhost(profile.L, "#2b6cff");
+  plotGhost(profile.R, "#e0334c");
+  plotAppliedGain(profile.L, "#2b6cff");
+  plotAppliedGain(profile.R, "#e0334c");
+
+  // Small inline legend explaining the dashed ghost line.
+  ctx.fillStyle = "#555";
+  ctx.font = "11px ui-sans-serif, system-ui";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("solid = applied EQ · dashed = raw audiogram dB HL",
+               cssW - padR - 2, padT + plotH - 4);
 }
 
 // ============================================================
@@ -498,6 +554,8 @@ const els = {
   speechGain: document.getElementById("speechGain"),
   noiseGain: document.getElementById("noiseGain"),
   masterGain: document.getElementById("masterGain"),
+  simIntensity: document.getElementById("simIntensity"),
+  simIntensityVal: document.getElementById("simIntensityVal"),
   audioStatus: document.getElementById("audioStatus"),
 };
 
@@ -644,6 +702,21 @@ function bindUi() {
   els.masterGain.addEventListener("input", (e) =>
     engine.setMasterGain(parseFloat(e.target.value))
   );
+
+  // Simulation intensity: live-updates the sensation-level scale. Re-applies
+  // the current profile so the change is audible mid-playback, and redraws
+  // the EQ curve so the viz matches.
+  els.simIntensity.addEventListener("input", (e) => {
+    SIM.scale = parseFloat(e.target.value);
+    els.simIntensityVal.textContent = SIM.scale.toFixed(2);
+    if (stageIdx >= 0) {
+      const profile = PROFILES[STAGES[stageIdx].profile];
+      engine.applyProfile(profile);
+      drawEqCurve(els.eqcurve, profile);
+    } else {
+      drawEqCurve(els.eqcurve, PROFILES.normal);
+    }
+  });
 
   window.addEventListener("resize", () => {
     const profile = stageIdx >= 0 ? PROFILES[STAGES[stageIdx].profile] : PROFILES.normal;
