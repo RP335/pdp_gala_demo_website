@@ -26,13 +26,20 @@ update per stage.
 
 ## How the DSP works
 
-- Audio graph: `speech + noise → ChannelSplitter → [L chain | R chain] → ChannelMerger → master → destination`
+- Audio graph: `speech → ChannelSplitter → [L chain | R chain] → ChannelMerger → master → destination`
 - Each ear chain is eleven `BiquadFilterNode`s in series, type `peaking`, centered at
   125, 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, and 8000 Hz.
-- Each filter's gain is set to the negative of the dB HL at that band, so
-  e.g. 40 dB HL at 4 kHz means a 40 dB cut at 4 kHz.
-- Background noise is either a user-supplied `audio/noise.wav` (loops
-  under the speech) or generated pink noise as a fallback.
+- Filter gain is **not** `-dB_HL` directly. dB HL is a threshold measurement;
+  applying it as signal attenuation over-mutes speech. Instead:
+
+    `effective_cut_dB = min(MAX, max(0, loss_dB − HEADROOM) × SCALE)`
+
+  This is a practical sensation-level approximation. Defaults: `HEADROOM=15`,
+  `SCALE=0.55`, `MAX=35`. The on-page **Sim intensity** slider scales `SCALE`
+  live so you can match a reference simulator by ear.
+- Background noise lives **outside** the webapp: the booth plays it from a
+  separate pair of loudspeakers so speech and noise arrive from different
+  directions.
 
 Limitation: this is a **spectral/loudness** simulation only. Real hearing
 loss also changes temporal processing, recruitment, and cognitive load,
@@ -58,8 +65,7 @@ the WAVs.
 1. Read `audio/README.md` — it has the script.
 2. Generate with ElevenLabs (or record your own).
 3. Save as `audio/male.wav` and `audio/female.wav`.
-4. (Optional) Add `audio/noise.wav` for custom background noise.
-5. Refresh the page.
+4. Refresh the page.
 
 The app loads audio on startup and shows which files it found in the
 status line at the bottom of the controls panel. If a file is missing,
@@ -95,16 +101,23 @@ The audiogram values live in `app.js` at the `PROFILES` constant. Edit
 them to match different clinical cases. The canvas renders automatically
 from whatever numbers are in there.
 
-If the EQ sounds too soft/sharp, adjust `PEAKING_Q` in `app.js`. Lower Q
-= broader filters = smoother curve but more overlap between bands.
-Higher Q = narrower but choppier. Default 1.4 is a typical graphic-EQ
-choice.
+If the EQ sounds too soft/sharp, adjust `PEAKING_Q` in `app.js` (default 1.0).
+Lower Q = broader filters = smoother curve but more overlap between bands.
+Higher Q = narrower but choppier. For bulk simulation intensity, use the
+on-page `Sim intensity` slider — it scales the sensation-level mapping
+live without touching code.
 
 ## Demo booth notes
 
-At the booth, the webapp is intended to run on a TV with a pair of
-speakers playing the processed speech. If a separate noise speaker is
-available, set the in-app `Noise` slider to 0 and play `audio/noise.wav`
-from the second speaker pair directly. That gives the audience a spatial
-sense of "speech vs. noise" the way a real incident scene would sound.
+The webapp drives the speech loudspeaker pair only. Background noise is
+played from a separate pair of loudspeakers (traffic, sirens, engine
+ambience, or whatever matches the scenario) so speech and noise arrive
+from different directions — the way it does on an actual scene.
+
+For unattended booth operation, check **Loop all day** in the controls.
+The demo auto-restarts from stage 1 after the last stage finishes, with
+a short pause at each loop boundary. On supported browsers, the page
+also requests a screen wake-lock while running so the TV doesn't sleep.
+One click on **Run full demo** in the morning is enough; no one has to
+touch the computer for the rest of the day.
 # pdp_gala_demo_website

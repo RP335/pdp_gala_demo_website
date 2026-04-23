@@ -4,11 +4,12 @@ Drop WAV files here with these exact names:
 
 - `male.wav`    — male voice reading the script below
 - `female.wav`  — female voice reading the script below
-- `noise.wav`   — *optional*. Background noise, ideally multi-talker babble or
-  ambient traffic/sirens. Looped under the speech. If missing, the app
-  generates pink noise as a fallback.
 
-All three files should be mono or stereo WAV, 16-bit PCM, 44.1 kHz or 48 kHz.
+Mono or stereo WAV, 16-bit PCM, 44.1 kHz or 48 kHz.
+
+> Background noise is not played through the webapp — the booth runs a
+> second pair of loudspeakers for that. If you ever need noise in-app for
+> remote demos, it can be added back as a separately-routed source.
 
 ## Recording script
 
@@ -20,10 +21,10 @@ some variety.
 
 ### Male voice
 
-> You will now hear me speaking while background noise is mixed in.
-> Depending on the hearing profile, my voice will sound clear, muffled,
-> or mostly unintelligible. This is roughly what a police officer or
-> firefighter hears when a command comes over their headset in the field.
+> You will now hear me speaking. Depending on the hearing profile, my
+> voice will sound clear, muffled, or mostly unintelligible. This is
+> roughly what a police officer or firefighter hears when a command
+> comes over their headset in the field.
 
 ### Female voice
 

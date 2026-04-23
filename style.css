@@ -267,6 +267,27 @@ button:disabled {
   display: inline-block;
 }
 
+.loop-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.loop-toggle input { cursor: pointer; }
+.loop-toggle:has(input:checked) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .status {
   color: var(--muted);
   font-size: 13px;

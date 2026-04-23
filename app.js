@@ -39,10 +39,10 @@ const PROFILES = {
 
 const TRANSCRIPTS = {
   male:
-    "You will now hear me speaking while background noise is mixed in. " +
-    "Depending on the hearing profile, my voice will sound clear, muffled, " +
-    "or mostly unintelligible. This is roughly what a police officer or " +
-    "firefighter hears when a command comes over their headset in the field.",
+    "You will now hear me speaking. Depending on the hearing profile, my " +
+    "voice will sound clear, muffled, or mostly unintelligible. This is " +
+    "roughly what a police officer or firefighter hears when a command " +
+    "comes over their headset in the field.",
   female:
     "Hearing loss is common among first responders because of years of " +
     "exposure to sirens, engines, and gunfire. Most do not wear hearing aids " +
@@ -69,7 +69,6 @@ const STAGES = [
 const AUDIO_PATHS = {
   male: "audio/male.wav",
   female: "audio/female.wav",
-  noise: "audio/noise.wav", // optional; falls back to generated pink noise
 };
 
 // Lower Q → broader, smoother peaking filters with less cumulative overlap
@@ -102,11 +101,9 @@ function lossToCutDb(lossDb) {
 class Engine {
   constructor() {
     this.ctx = null;
-    this.buffers = { male: null, female: null, noise: null };
+    this.buffers = { male: null, female: null };
     this.speechSource = null;
-    this.noiseSource = null;
     this.speechGain = null;
-    this.noiseGain = null;
     this.masterGain = null;
     this.splitter = null;
     this.merger = null;
@@ -140,29 +137,23 @@ class Engine {
     this.filtersL = makeChain();
     this.filtersR = makeChain();
 
-    // Mixer gains forced to stereo with "speakers" interpretation so that
-    // mono WAVs get duplicated to L+R before the per-ear split. Otherwise
-    // a mono input would leave the right channel silent.
-    const stereoGain = (v) => {
-      const g = this.ctx.createGain();
-      g.gain.value = v;
-      g.channelCount = 2;
-      g.channelCountMode = "explicit";
-      g.channelInterpretation = "speakers";
-      return g;
-    };
+    // Force stereo with "speakers" interpretation so a mono WAV is
+    // duplicated to L+R before the per-ear split. Without this, mono input
+    // would leave the right channel silent.
+    this.speechGain = this.ctx.createGain();
+    this.speechGain.gain.value = 0.9;
+    this.speechGain.channelCount = 2;
+    this.speechGain.channelCountMode = "explicit";
+    this.speechGain.channelInterpretation = "speakers";
 
-    this.speechGain = stereoGain(0.9);
-    this.noiseGain = stereoGain(0.25);
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 0.8;
 
-    // Mix speech + noise, then split to per-ear chains, then merge.
+    // Speech → split to per-ear filter chains → merge.
     this.splitter = this.ctx.createChannelSplitter(2);
     this.merger = this.ctx.createChannelMerger(2);
 
     this.speechGain.connect(this.splitter);
-    this.noiseGain.connect(this.splitter);
 
     this.splitter.connect(this.filtersL[0], 0);
     this.splitter.connect(this.filtersR[0], 1);
@@ -174,8 +165,8 @@ class Engine {
     this.masterGain.connect(this.ctx.destination);
   }
 
-  async loadBuffers(statusEl) {
-    const results = { male: false, female: false, noise: false };
+  async loadBuffers() {
+    const results = { male: false, female: false };
 
     const tryLoad = async (key) => {
       try {
@@ -191,36 +182,8 @@ class Engine {
       }
     };
 
-    await Promise.all([tryLoad("male"), tryLoad("female"), tryLoad("noise")]);
-
-    // Fallback: generate pink noise if noise.wav is absent.
-    if (!this.buffers.noise) {
-      this.buffers.noise = this._generatePinkNoise(6);
-    }
+    await Promise.all([tryLoad("male"), tryLoad("female")]);
     return results;
-  }
-
-  _generatePinkNoise(durationSec) {
-    const sampleRate = this.ctx.sampleRate;
-    const length = sampleRate * durationSec;
-    const buffer = this.ctx.createBuffer(2, length, sampleRate);
-    for (let ch = 0; ch < 2; ch++) {
-      const data = buffer.getChannelData(ch);
-      // Paul Kellet's economy pink-noise filter
-      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-      for (let i = 0; i < length; i++) {
-        const white = Math.random() * 2 - 1;
-        b0 = 0.99886 * b0 + white * 0.0555179;
-        b1 = 0.99332 * b1 + white * 0.0750759;
-        b2 = 0.96900 * b2 + white * 0.1538520;
-        b3 = 0.86650 * b3 + white * 0.3104856;
-        b4 = 0.55000 * b4 + white * 0.5329522;
-        b5 = -0.7616 * b5 - white * 0.0168980;
-        data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11;
-        b6 = white * 0.115926;
-      }
-    }
-    return buffer;
   }
 
   applyProfile(profile) {
@@ -246,30 +209,19 @@ class Engine {
     this.currentVoice = voice;
     this.onEnded = onEnded;
 
-    // Speech
     this.speechSource = this.ctx.createBufferSource();
     this.speechSource.buffer = this.buffers[voice];
     this.speechSource.connect(this.speechGain);
 
-    // Noise (loops under the speech)
-    this.noiseSource = this.ctx.createBufferSource();
-    this.noiseSource.buffer = this.buffers.noise;
-    this.noiseSource.loop = true;
-    this.noiseSource.connect(this.noiseGain);
-
-    // End of speech = end of stage; noise stops with it.
     this.speechSource.onended = () => {
       if (!this.playing) return; // already stopped externally
       this.playing = false;
-      try { this.noiseSource.stop(); } catch (_) {}
       const cb = this.onEnded;
       this.onEnded = null;
       cb && cb({ reason: "complete" });
     };
 
-    const t = this.ctx.currentTime + 0.05;
-    this.speechSource.start(t);
-    this.noiseSource.start(t);
+    this.speechSource.start(this.ctx.currentTime + 0.05);
     this.playing = true;
     return this.buffers[voice].duration;
   }
@@ -277,13 +229,10 @@ class Engine {
   stop() {
     this.playing = false;
     try { if (this.speechSource) this.speechSource.stop(); } catch (_) {}
-    try { if (this.noiseSource) this.noiseSource.stop(); } catch (_) {}
     this.speechSource = null;
-    this.noiseSource = null;
   }
 
   setSpeechGain(v) { this.speechGain && (this.speechGain.gain.value = v); }
-  setNoiseGain(v)  { this.noiseGain  && (this.noiseGain.gain.value  = v); }
   setMasterGain(v) { this.masterGain && (this.masterGain.gain.value = v); }
 
   resume() { return this.ctx.resume(); }
@@ -552,19 +501,36 @@ const els = {
   pauseBtn: document.getElementById("pauseBtn"),
   stopBtn: document.getElementById("stopBtn"),
   speechGain: document.getElementById("speechGain"),
-  noiseGain: document.getElementById("noiseGain"),
   masterGain: document.getElementById("masterGain"),
   simIntensity: document.getElementById("simIntensity"),
   simIntensityVal: document.getElementById("simIntensityVal"),
+  loopToggle: document.getElementById("loopToggle"),
   audioStatus: document.getElementById("audioStatus"),
 };
 
 const engine = new Engine();
 let stageIdx = -1;
 let running = false;          // "auto-advance through all stages"
+let loopEnabled = false;      // wrap back to stage 0 after the last one
 let progressTimer = null;
 let stageStartTime = 0;
 let stageDuration = 0;
+let wakeLock = null;
+
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  } catch (_) { /* browser may refuse; safe to ignore */ }
+}
+
+// Re-acquire the wake lock when the tab becomes visible again — browsers
+// release it automatically when a tab is backgrounded.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && running) requestWakeLock();
+});
 
 function buildDots() {
   els.stageDots.innerHTML = "";
@@ -633,16 +599,29 @@ async function runStage(idx, { autoAdvance }) {
         "warn"
       );
       if (autoAdvance && running) {
-        // Skip missing voice and keep going
-        setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 200);
+        const nextIdx = idx + 1 < STAGES.length ? idx + 1
+                      : loopEnabled ? 0 : -1;
+        if (nextIdx >= 0) {
+          setTimeout(() => runStage(nextIdx, { autoAdvance: true }), 200);
+        } else {
+          running = false;
+          els.playBtn.textContent = "▶ Run full demo";
+        }
       }
       return;
     }
-    if (autoAdvance && running && idx + 1 < STAGES.length) {
-      setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 400);
-    } else if (idx + 1 >= STAGES.length) {
-      running = false;
-      els.playBtn.textContent = "▶ Run full demo";
+    if (autoAdvance && running) {
+      const isLast = idx + 1 >= STAGES.length;
+      if (!isLast) {
+        setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 400);
+      } else if (loopEnabled) {
+        // Longer pause at the loop boundary so the last stage's "100%" is
+        // visible and the restart doesn't feel frantic to a new viewer.
+        setTimeout(() => runStage(0, { autoAdvance: true }), 1500);
+      } else {
+        running = false;
+        els.playBtn.textContent = "▶ Run full demo";
+      }
     }
   });
 
@@ -652,7 +631,6 @@ async function runStage(idx, { autoAdvance }) {
 function bindUi() {
   els.playBtn.addEventListener("click", async () => {
     if (running) {
-      // pause-like: stop the loop
       running = false;
       engine.stop();
       stopProgress();
@@ -661,8 +639,8 @@ function bindUi() {
     }
     running = true;
     els.playBtn.textContent = "⏸ Stop demo";
-    const startAt = stageIdx >= 0 && stageIdx < STAGES.length - 1 ? 0 : 0;
-    runStage(startAt, { autoAdvance: true });
+    requestWakeLock();
+    runStage(0, { autoAdvance: true });
   });
 
   els.pauseBtn.addEventListener("click", async () => {
@@ -696,12 +674,13 @@ function bindUi() {
   els.speechGain.addEventListener("input", (e) =>
     engine.setSpeechGain(parseFloat(e.target.value))
   );
-  els.noiseGain.addEventListener("input", (e) =>
-    engine.setNoiseGain(parseFloat(e.target.value))
-  );
   els.masterGain.addEventListener("input", (e) =>
     engine.setMasterGain(parseFloat(e.target.value))
   );
+
+  els.loopToggle.addEventListener("change", (e) => {
+    loopEnabled = e.target.checked;
+  });
 
   // Simulation intensity: live-updates the sensation-level scale. Re-applies
   // the current profile so the change is audible mid-playback, and redraws
@@ -740,7 +719,7 @@ async function main() {
   if (!loaded.female) missing.push("audio/female.wav");
 
   if (missing.length === 0) {
-    setStatus("Audio: male + female ready · noise ready", "ok");
+    setStatus("Audio: male + female ready", "ok");
   } else {
     setStatus(
       `Audio: missing ${missing.join(", ")} — drop WAV files in /audio/ and refresh.`,
