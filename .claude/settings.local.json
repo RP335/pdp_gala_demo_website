@@ -10,7 +10,8 @@
       "Bash(curl -s http://localhost:8765/)",
       "Bash(curl -s http://localhost:8765/app.js)",
       "Bash(kill %1)",
-      "Bash(pkill -f \"http.server 8765\")"
+      "Bash(pkill -f \"http.server 8765\")",
+      "Bash(node -c app.js)"
     ]
   }
 }

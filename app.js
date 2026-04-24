@@ -1,15 +1,15 @@
 // Hearing Loss Simulator — Aalto PdP
-// Plain-JS / Web Audio API. No build step. Hostable on GitHub Pages.
+// Plain JS / Web Audio API. Booth flow: auto-loops male↔female voices through
+// an active audiogram. Tapping an NFC card on the Teensy hot-swaps the active
+// audiogram live. No session state, no logout.
 
 // ============================================================
-// 1. Audiogram profiles (dB HL per band, per ear)
+// 1. Audiogram profiles — used only to label incoming NFC data
+//    with a friendly name when the values match a known pattern.
 // ============================================================
 
 const FREQS = [125, 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000];
 
-// Hearing-loss profiles. Values are dB HL (positive = more loss).
-// Symmetric profiles have L == R. Asymmetric mirrors real noise-induced loss
-// from e.g. firearms training: one ear clearly worse than the other.
 const PROFILES = {
   normal: {
     label: "Normal hearing",
@@ -34,36 +34,7 @@ const PROFILES = {
 };
 
 // ============================================================
-// 2. Demo script + stages
-// ============================================================
-
-const TRANSCRIPTS = {
-  male:
-    "You will now hear me speaking. Depending on the hearing profile, my " +
-    "voice will sound clear, muffled, or mostly unintelligible. This is " +
-    "roughly what a police officer or firefighter hears when a command " +
-    "comes over their headset in the field.",
-  female:
-    "Hearing loss is common among first responders because of years of " +
-    "exposure to sirens, engines, and gunfire. Most do not wear hearing aids " +
-    "— conventional aids don't fit under duty headsets, and stigma keeps " +
-    "them away until the loss is severe. This demo shows why assistance " +
-    "inside the headset matters.",
-};
-
-const STAGES = [
-  { voice: "male",   profile: "normal",     durationSec: null },
-  { voice: "male",   profile: "moderate",   durationSec: null },
-  { voice: "male",   profile: "severe",     durationSec: null },
-  { voice: "male",   profile: "asymmetric", durationSec: null },
-  { voice: "female", profile: "normal",     durationSec: null },
-  { voice: "female", profile: "moderate",   durationSec: null },
-  { voice: "female", profile: "severe",     durationSec: null },
-  { voice: "female", profile: "asymmetric", durationSec: null },
-];
-
-// ============================================================
-// 3. Audio engine
+// 2. Audio engine
 // ============================================================
 
 const AUDIO_PATHS = {
@@ -71,22 +42,8 @@ const AUDIO_PATHS = {
   female: "audio/female.wav",
 };
 
-// Lower Q → broader, smoother peaking filters with less cumulative overlap
-// between adjacent bands. 1.4 was too narrow+overlapping and piled up
-// attenuation in the 3–8 kHz region of the severe profile.
 const PEAKING_Q = 1.0;
 
-// dB HL on an audiogram is a *threshold* measurement, not a signal
-// attenuation. A listener with 40 dB HL at 4 kHz still hears conversational
-// speech at 4 kHz — it's just above their raised threshold by ~20 dB of
-// sensation level, not silent. Applying -loss_dB directly to the signal
-// over-attenuates drastically.
-//
-// This is a practical approximation of the sensation-level model:
-//   effective_cut = min(MAX, max(0, loss_dB - HEADROOM) * SCALE)
-// The HEADROOM accounts for speech sitting well above normal threshold;
-// SCALE compresses the residual loss into perceived attenuation; MAX caps
-// the per-band cut to avoid unstable filters and cumulative overlap.
 const SIM = {
   headroomDb: 15,
   scale: 0.55,
@@ -109,17 +66,13 @@ class Engine {
     this.merger = null;
     this.filtersL = [];
     this.filtersR = [];
-    this.activeProfile = PROFILES.normal;
     this.playing = false;
-    this.currentVoice = null;
-    this.onEnded = null;
   }
 
   async init() {
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
 
-    // One peaking biquad per band, per ear. All chained in series per side.
-    const makeChain = (bands) => {
+    const makeChain = () => {
       const chain = [];
       for (const f of FREQS) {
         const filter = this.ctx.createBiquadFilter();
@@ -129,7 +82,6 @@ class Engine {
         filter.gain.value = 0;
         chain.push(filter);
       }
-      // series wiring
       for (let i = 0; i < chain.length - 1; i++) chain[i].connect(chain[i + 1]);
       return chain;
     };
@@ -137,9 +89,6 @@ class Engine {
     this.filtersL = makeChain();
     this.filtersR = makeChain();
 
-    // Force stereo with "speakers" interpretation so a mono WAV is
-    // duplicated to L+R before the per-ear split. Without this, mono input
-    // would leave the right channel silent.
     this.speechGain = this.ctx.createGain();
     this.speechGain.gain.value = 0.9;
     this.speechGain.channelCount = 2;
@@ -149,65 +98,50 @@ class Engine {
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 0.8;
 
-    // Speech → split to per-ear filter chains → merge.
     this.splitter = this.ctx.createChannelSplitter(2);
-    this.merger = this.ctx.createChannelMerger(2);
+    this.merger   = this.ctx.createChannelMerger(2);
 
     this.speechGain.connect(this.splitter);
-
     this.splitter.connect(this.filtersL[0], 0);
     this.splitter.connect(this.filtersR[0], 1);
-
     this.filtersL[this.filtersL.length - 1].connect(this.merger, 0, 0);
     this.filtersR[this.filtersR.length - 1].connect(this.merger, 0, 1);
-
     this.merger.connect(this.masterGain);
     this.masterGain.connect(this.ctx.destination);
   }
 
   async loadBuffers() {
     const results = { male: false, female: false };
-
     const tryLoad = async (key) => {
       try {
         const res = await fetch(AUDIO_PATHS[key]);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const arr = await res.arrayBuffer();
-        const buf = await this.ctx.decodeAudioData(arr);
-        this.buffers[key] = buf;
+        this.buffers[key] = await this.ctx.decodeAudioData(arr);
         results[key] = true;
-      } catch (e) {
+      } catch (_) {
         this.buffers[key] = null;
-        results[key] = false;
       }
     };
-
     await Promise.all([tryLoad("male"), tryLoad("female")]);
     return results;
   }
 
   applyProfile(profile) {
-    this.activeProfile = profile;
     const t = this.ctx.currentTime;
     for (let i = 0; i < FREQS.length; i++) {
-      // Map clinical dB HL → effective signal attenuation via the
-      // sensation-level approximation (see SIM constants / lossToCutDb).
-      const cutL = -lossToCutDb(profile.L[i]);
-      const cutR = -lossToCutDb(profile.R[i]);
-      this.filtersL[i].gain.setTargetAtTime(cutL, t, 0.03);
-      this.filtersR[i].gain.setTargetAtTime(cutR, t, 0.03);
+      this.filtersL[i].gain.setTargetAtTime(-lossToCutDb(profile.L[i]), t, 0.03);
+      this.filtersR[i].gain.setTargetAtTime(-lossToCutDb(profile.R[i]), t, 0.03);
     }
   }
 
-  playStage(voice, profile, onEnded) {
+  playVoice(voice, profile, onEnded) {
     if (!this.buffers[voice]) {
       onEnded && onEnded({ reason: "missing" });
       return null;
     }
-    this.stop(); // stop any existing source
+    this.stop();
     this.applyProfile(profile);
-    this.currentVoice = voice;
-    this.onEnded = onEnded;
 
     this.speechSource = this.ctx.createBufferSource();
     this.speechSource.buffer = this.buffers[voice];
@@ -216,9 +150,7 @@ class Engine {
     this.speechSource.onended = () => {
       if (!this.playing) return; // already stopped externally
       this.playing = false;
-      const cb = this.onEnded;
-      this.onEnded = null;
-      cb && cb({ reason: "complete" });
+      onEnded && onEnded({ reason: "complete" });
     };
 
     this.speechSource.start(this.ctx.currentTime + 0.05);
@@ -234,13 +166,12 @@ class Engine {
 
   setSpeechGain(v) { this.speechGain && (this.speechGain.gain.value = v); }
   setMasterGain(v) { this.masterGain && (this.masterGain.gain.value = v); }
-
-  resume() { return this.ctx.resume(); }
+  resume()  { return this.ctx.resume(); }
   suspend() { return this.ctx.suspend(); }
 }
 
 // ============================================================
-// 4. Audiogram + EQ curve drawing
+// 3. Audiogram + EQ curve drawing
 // ============================================================
 
 function drawAudiogram(canvas, profile) {
@@ -263,50 +194,39 @@ function drawAudiogram(canvas, profile) {
   const maxF = Math.log2(8000);
   const xFor = (f) => padL + ((Math.log2(f) - minF) / (maxF - minF)) * plotW;
 
-  const dbMin = -10;
-  const dbMax = 80;
+  const dbMin = -10, dbMax = 80;
   const yFor = (db) => padT + ((db - dbMin) / (dbMax - dbMin)) * plotH;
 
-  // dB severity bands (matches the reference audiogram shading)
   const bands = [
-    { from: -10, to: 25, color: "#e6f4ea" }, // normal
-    { from: 25,  to: 40, color: "#e8f0fe" }, // mild
-    { from: 40,  to: 55, color: "#eae6f7" }, // moderate
-    { from: 55,  to: 70, color: "#fff4e5" }, // moderately severe
-    { from: 70,  to: 80, color: "#fde8e8" }, // severe
+    { from: -10, to: 25, color: "#e6f4ea" },
+    { from: 25,  to: 40, color: "#e8f0fe" },
+    { from: 40,  to: 55, color: "#eae6f7" },
+    { from: 55,  to: 70, color: "#fff4e5" },
+    { from: 70,  to: 80, color: "#fde8e8" },
   ];
   for (const b of bands) {
     ctx.fillStyle = b.color;
     ctx.fillRect(padL, yFor(b.from), plotW, yFor(b.to) - yFor(b.from));
   }
 
-  // grid
   ctx.strokeStyle = "#c9ced8";
   ctx.lineWidth = 1;
   ctx.font = "12px ui-sans-serif, system-ui";
   ctx.fillStyle = "#444";
 
-  // horizontal (dB) grid
   for (let db = 0; db <= 80; db += 10) {
     const y = yFor(db);
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(padL + plotW, y);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y);
     ctx.strokeStyle = db === 0 ? "#888" : "#d8dce3";
     ctx.stroke();
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
     ctx.fillText(String(db), padL - 6, y);
   }
 
-  // vertical (freq) grid
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
   for (const f of FREQS) {
     const x = xFor(f);
-    ctx.beginPath();
-    ctx.moveTo(x, padT);
-    ctx.lineTo(x, padT + plotH);
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH);
     ctx.strokeStyle = "#e1e5ec";
     ctx.stroke();
     const label = f >= 1000 ? (f / 1000) + "k" : String(f);
@@ -314,16 +234,13 @@ function drawAudiogram(canvas, profile) {
     ctx.fillText(label, x, padT + plotH + 6);
   }
 
-  // frame
   ctx.strokeStyle = "#9aa3b2";
   ctx.strokeRect(padL, padT, plotW, plotH);
 
-  // Axis titles
   ctx.save();
   ctx.translate(14, padT + plotH / 2);
   ctx.rotate(-Math.PI / 2);
-  ctx.textAlign = "center";
-  ctx.fillStyle = "#333";
+  ctx.textAlign = "center"; ctx.fillStyle = "#333";
   ctx.fillText("Hearing level (dB HL)", 0, 0);
   ctx.restore();
 
@@ -331,33 +248,24 @@ function drawAudiogram(canvas, profile) {
   ctx.textAlign = "center";
   ctx.fillText("Frequency (Hz)", padL + plotW / 2, cssH - 6);
 
-  // plot left (blue X) and right (red O)
   const plotSeries = (values, color, marker) => {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
     ctx.beginPath();
     values.forEach((db, i) => {
-      const x = xFor(FREQS[i]);
-      const y = yFor(db);
+      const x = xFor(FREQS[i]); const y = yFor(db);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
-
-    ctx.fillStyle = color;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.fillStyle = color; ctx.strokeStyle = color; ctx.lineWidth = 2;
     values.forEach((db, i) => {
-      const x = xFor(FREQS[i]);
-      const y = yFor(db);
+      const x = xFor(FREQS[i]); const y = yFor(db);
       if (marker === "x") {
         ctx.beginPath();
         ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6);
         ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6);
         ctx.stroke();
       } else {
-        ctx.beginPath();
-        ctx.arc(x, y, 6, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
       }
     });
   };
@@ -365,12 +273,9 @@ function drawAudiogram(canvas, profile) {
   plotSeries(profile.L, "#2b6cff", "x");
   plotSeries(profile.R, "#e0334c", "o");
 
-  // legend
   ctx.font = "12px ui-sans-serif, system-ui";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  const lx = padL + 8;
-  const ly = padT + 10;
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  const lx = padL + 8, ly = padT + 10;
   ctx.fillStyle = "#e0334c"; ctx.beginPath(); ctx.arc(lx + 4, ly, 5, 0, Math.PI * 2); ctx.stroke();
   ctx.fillStyle = "#333"; ctx.fillText("Right ear (O)", lx + 16, ly);
   ctx.fillStyle = "#2b6cff";
@@ -408,7 +313,6 @@ function drawEqCurve(canvas, profile) {
   ctx.fillStyle = "#f7f8fa";
   ctx.fillRect(0, 0, cssW, cssH);
 
-  // grid
   ctx.strokeStyle = "#d8dce3";
   ctx.fillStyle = "#444";
   ctx.font = "11px ui-sans-serif, system-ui";
@@ -425,8 +329,7 @@ function drawEqCurve(canvas, profile) {
   for (const f of FREQS) {
     const x = xFor(f);
     ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH);
-    ctx.strokeStyle = "#e1e5ec";
-    ctx.stroke();
+    ctx.strokeStyle = "#e1e5ec"; ctx.stroke();
     const label = f >= 1000 ? (f / 1000) + "k" : String(f);
     ctx.fillStyle = "#444";
     ctx.fillText(label, x, padT + plotH + 4);
@@ -435,40 +338,31 @@ function drawEqCurve(canvas, profile) {
   ctx.strokeStyle = "#9aa3b2";
   ctx.strokeRect(padL, padT, plotW, plotH);
 
-  const plotAppliedGain = (values, color) => {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
+  const plotGhost = (values, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]); ctx.globalAlpha = 0.4;
     ctx.beginPath();
     values.forEach((db, i) => {
-      const x = xFor(FREQS[i]);
-      const y = yFor(-lossToCutDb(db)); // applied cut (sensation-level mapped)
+      const x = xFor(FREQS[i]); const y = yFor(-db);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  };
+
+  const plotAppliedGain = (values, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    values.forEach((db, i) => {
+      const x = xFor(FREQS[i]); const y = yFor(-lossToCutDb(db));
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
     ctx.fillStyle = color;
     values.forEach((db, i) => {
-      const x = xFor(FREQS[i]);
-      const y = yFor(-lossToCutDb(db));
+      const x = xFor(FREQS[i]); const y = yFor(-lossToCutDb(db));
       ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
     });
-  };
-
-  // Ghost line: raw audiogram dB (for comparison — shows how much the
-  // sensation-level mapping compresses the clinical values).
-  const plotGhost = (values, color) => {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 4]);
-    ctx.globalAlpha = 0.4;
-    ctx.beginPath();
-    values.forEach((db, i) => {
-      const x = xFor(FREQS[i]);
-      const y = yFor(-db);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
   };
 
   plotGhost(profile.L, "#2b6cff");
@@ -476,46 +370,154 @@ function drawEqCurve(canvas, profile) {
   plotAppliedGain(profile.L, "#2b6cff");
   plotAppliedGain(profile.R, "#e0334c");
 
-  // Small inline legend explaining the dashed ghost line.
   ctx.fillStyle = "#555";
   ctx.font = "11px ui-sans-serif, system-ui";
-  ctx.textAlign = "right";
-  ctx.textBaseline = "bottom";
+  ctx.textAlign = "right"; ctx.textBaseline = "bottom";
   ctx.fillText("solid = applied EQ · dashed = raw audiogram dB HL",
                cssW - padR - 2, padT + plotH - 4);
 }
 
 // ============================================================
-// 5. UI / state machine
+// 4. Serial bridge — Teensy NFC reader over Web Serial API
+// ============================================================
+//
+// Teensy emits line-terminated messages at 115200 baud:
+//   READY,v1
+//   LOGIN,<UID>,L:a/b/c/...,R:a/b/c/...   (11 values each)
+//   ERROR,<reason>
+//
+// On LOGIN we hot-swap the active audiogram; on READY we just update the
+// status pill.
+
+class SerialBridge {
+  constructor(handlers) {
+    this.handlers = handlers;
+    this.port = null;
+    this.reader = null;
+    this.buffer = "";
+    this.connected = false;
+  }
+
+  // Teensy (PJRC) USB vendor ID — limits the picker so users can't
+  // mis-pick an FTDI/CH340 dongle or a Bluetooth serial port.
+  static FILTERS = [{ usbVendorId: 0x16C0 }];
+
+  static supported() { return "serial" in navigator; }
+
+  async connect(existingPort) {
+    const port = existingPort || await navigator.serial.requestPort({
+      filters: SerialBridge.FILTERS,
+    });
+    await port.open({ baudRate: 115200 });
+    this.port = port;
+    this.connected = true;
+    this.handlers.onStatus("connected");
+    this._readLoop();
+  }
+
+  async disconnect() {
+    this.connected = false;
+    if (this.reader) { try { await this.reader.cancel(); } catch (_) {} }
+    if (this.port)   { try { await this.port.close();   } catch (_) {} this.port = null; }
+    this.handlers.onStatus("disconnected");
+  }
+
+  async _readLoop() {
+    const decoder = new TextDecoderStream();
+    const closed = this.port.readable.pipeTo(decoder.writable).catch(() => {});
+    this.reader = decoder.readable.getReader();
+    try {
+      while (this.connected) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        this.buffer += value;
+        let idx;
+        while ((idx = this.buffer.indexOf("\n")) >= 0) {
+          const line = this.buffer.slice(0, idx).replace(/\r$/, "");
+          this.buffer = this.buffer.slice(idx + 1);
+          if (line) this._dispatch(line);
+        }
+      }
+    } catch (e) {
+      this.handlers.onError && this.handlers.onError(e.message || String(e));
+    } finally {
+      try { this.reader.releaseLock(); } catch (_) {}
+      this.reader = null;
+      await closed;
+      this.connected = false;
+      this.handlers.onStatus("disconnected");
+    }
+  }
+
+  _dispatch(line) {
+    console.log("[serial] <-", line);
+    if (line.startsWith("LOGIN,")) {
+      const m = /^LOGIN,([^,]+),L:([^,]+),R:(.+)$/.exec(line);
+      if (m) {
+        const toArr = (s) => s.split("/").map((n) => parseInt(n, 10));
+        this.handlers.onLogin({ uid: m[1], L: toArr(m[2]), R: toArr(m[3]) });
+      }
+    } else if (line.startsWith("READY,")) {
+      this.handlers.onReady && this.handlers.onReady();
+    } else if (line.startsWith("ERROR,")) {
+      this.handlers.onError && this.handlers.onError(line);
+    }
+  }
+}
+
+function arraysEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function matchNamedProfile(L, R) {
+  for (const [key, p] of Object.entries(PROFILES)) {
+    if (arraysEqual(p.L, L) && arraysEqual(p.R, R)) return { key, label: p.label };
+  }
+  return null;
+}
+
+function shortUid(uid) {
+  if (!uid) return "";
+  if (uid.length <= 8) return uid;
+  return uid.slice(0, 4) + "…" + uid.slice(-4);
+}
+
+// ============================================================
+// 5. App state + continuous playback loop
 // ============================================================
 
 const els = {
-  voiceLabel: document.getElementById("voiceLabel"),
-  profileLabel: document.getElementById("profileLabel"),
-  transcript: document.getElementById("transcript"),
-  progressFill: document.getElementById("progressFill"),
-  stageDots: document.getElementById("stageDots"),
-  audiogram: document.getElementById("audiogram"),
-  eqcurve: document.getElementById("eqcurve"),
-  playBtn: document.getElementById("playBtn"),
-  pauseBtn: document.getElementById("pauseBtn"),
-  stopBtn: document.getElementById("stopBtn"),
-  speechGain: document.getElementById("speechGain"),
-  masterGain: document.getElementById("masterGain"),
-  simIntensity: document.getElementById("simIntensity"),
-  simIntensityVal: document.getElementById("simIntensityVal"),
-  loopToggle: document.getElementById("loopToggle"),
-  audioStatus: document.getElementById("audioStatus"),
+  voiceLabel:     document.getElementById("voiceLabel"),
+  profileLabel:   document.getElementById("profileLabel"),
+  progressFill:   document.getElementById("progressFill"),
+  audiogram:      document.getElementById("audiogram"),
+  eqcurve:        document.getElementById("eqcurve"),
+  pauseBtn:       document.getElementById("pauseBtn"),
+  speechGain:     document.getElementById("speechGain"),
+  masterGain:     document.getElementById("masterGain"),
+  simIntensity:   document.getElementById("simIntensity"),
+  simIntensityVal:document.getElementById("simIntensityVal"),
+  audioStatus:    document.getElementById("audioStatus"),
+  serialBtn:      document.getElementById("serialBtn"),
+  serialStatus:   document.getElementById("serialStatus"),
 };
 
 const engine = new Engine();
-let stageIdx = -1;
-let running = false;          // "auto-advance through all stages"
-let loopEnabled = false;      // wrap back to stage 0 after the last one
-let progressTimer = null;
+
+let activeProfile = {
+  label: PROFILES.normal.label,
+  L: PROFILES.normal.L,
+  R: PROFILES.normal.R,
+};
+let currentVoice   = "male";
+let playbackRunning = false;
+let progressTimer  = null;
 let stageStartTime = 0;
-let stageDuration = 0;
-let wakeLock = null;
+let stageDuration  = 0;
+let wakeLock       = null;
+let serial         = null;
 
 async function requestWakeLock() {
   try {
@@ -523,126 +525,149 @@ async function requestWakeLock() {
       wakeLock = await navigator.wakeLock.request("screen");
       wakeLock.addEventListener("release", () => { wakeLock = null; });
     }
-  } catch (_) { /* browser may refuse; safe to ignore */ }
+  } catch (_) {}
 }
-
-// Re-acquire the wake lock when the tab becomes visible again — browsers
-// release it automatically when a tab is backgrounded.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && running) requestWakeLock();
+  if (document.visibilityState === "visible" && playbackRunning) requestWakeLock();
 });
-
-function buildDots() {
-  els.stageDots.innerHTML = "";
-  STAGES.forEach((_, i) => {
-    const d = document.createElement("div");
-    d.className = "dot";
-    d.title = `${STAGES[i].voice} · ${PROFILES[STAGES[i].profile].label}`;
-    els.stageDots.appendChild(d);
-  });
-}
-
-function updateDots() {
-  [...els.stageDots.children].forEach((d, i) => {
-    d.classList.toggle("current", i === stageIdx);
-    d.classList.toggle("done", i < stageIdx);
-  });
-}
-
-function updateStageUi(stage) {
-  const profile = PROFILES[stage.profile];
-  els.voiceLabel.textContent =
-    (stage.voice === "male" ? "Male voice" : "Female voice");
-  els.profileLabel.textContent = profile.label;
-  els.transcript.textContent = TRANSCRIPTS[stage.voice];
-  drawAudiogram(els.audiogram, profile);
-  drawEqCurve(els.eqcurve, profile);
-  updateDots();
-}
-
-function setStatus(text, cls) {
-  els.audioStatus.textContent = text;
-  els.audioStatus.className = "status" + (cls ? " " + cls : "");
-}
 
 function startProgress(duration) {
   stopProgress();
   stageStartTime = performance.now();
   stageDuration = duration * 1000;
   progressTimer = setInterval(() => {
-    const pct = Math.min(
-      100,
-      ((performance.now() - stageStartTime) / stageDuration) * 100
-    );
+    const pct = Math.min(100,
+      ((performance.now() - stageStartTime) / stageDuration) * 100);
     els.progressFill.style.width = pct + "%";
   }, 80);
 }
-
 function stopProgress() {
   if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
 }
 
-async function runStage(idx, { autoAdvance }) {
-  if (idx < 0 || idx >= STAGES.length) return;
-  stageIdx = idx;
-  const stage = STAGES[idx];
-  updateStageUi(stage);
+function updateUiForCurrent() {
+  els.voiceLabel.textContent   = currentVoice === "male" ? "Male voice" : "Female voice";
+  els.profileLabel.textContent = activeProfile.label;
+  drawAudiogram(els.audiogram, activeProfile);
+  drawEqCurve(els.eqcurve, activeProfile);
+}
 
+async function startPlayback() {
+  if (playbackRunning) return;
+  playbackRunning = true;
   await engine.resume();
+  requestWakeLock();
+  playNext();
+}
 
-  const duration = engine.playStage(stage.voice, PROFILES[stage.profile], (info) => {
+function playNext() {
+  if (!playbackRunning) return;
+  updateUiForCurrent();
+
+  if (!engine.buffers[currentVoice]) {
+    const other = currentVoice === "male" ? "female" : "male";
+    if (!engine.buffers[other]) return; // nothing to play
+    currentVoice = other;
+    setTimeout(playNext, 300);
+    return;
+  }
+
+  const duration = engine.playVoice(currentVoice, activeProfile, (info) => {
     stopProgress();
     els.progressFill.style.width = "100%";
-    if (info.reason === "missing") {
-      setStatus(
-        `Audio file not found: audio/${stage.voice}.wav — drop in a WAV to play this voice.`,
-        "warn"
-      );
-      if (autoAdvance && running) {
-        const nextIdx = idx + 1 < STAGES.length ? idx + 1
-                      : loopEnabled ? 0 : -1;
-        if (nextIdx >= 0) {
-          setTimeout(() => runStage(nextIdx, { autoAdvance: true }), 200);
-        } else {
-          running = false;
-          els.playBtn.textContent = "▶ Run full demo";
-        }
-      }
-      return;
+    if (!playbackRunning) return;
+    if (engine.buffers[currentVoice === "male" ? "female" : "male"]) {
+      currentVoice = currentVoice === "male" ? "female" : "male";
     }
-    if (autoAdvance && running) {
-      const isLast = idx + 1 >= STAGES.length;
-      if (!isLast) {
-        setTimeout(() => runStage(idx + 1, { autoAdvance: true }), 400);
-      } else if (loopEnabled) {
-        // Longer pause at the loop boundary so the last stage's "100%" is
-        // visible and the restart doesn't feel frantic to a new viewer.
-        setTimeout(() => runStage(0, { autoAdvance: true }), 1500);
-      } else {
-        running = false;
-        els.playBtn.textContent = "▶ Run full demo";
-      }
-    }
+    setTimeout(() => { if (playbackRunning) playNext(); }, 600);
   });
-
   if (duration) startProgress(duration);
 }
 
-function bindUi() {
-  els.playBtn.addEventListener("click", async () => {
-    if (running) {
-      running = false;
-      engine.stop();
-      stopProgress();
-      els.playBtn.textContent = "▶ Run full demo";
-      return;
-    }
-    running = true;
-    els.playBtn.textContent = "⏸ Stop demo";
-    requestWakeLock();
-    runStage(0, { autoAdvance: true });
-  });
+function applyCardAudiogram({ uid, L, R }) {
+  const match = matchNamedProfile(L, R);
+  const baseLabel = match ? match.label : "Custom audiogram";
+  activeProfile = { label: `${baseLabel} · ${shortUid(uid)}`, L, R };
+  engine.applyProfile(activeProfile);           // hot-swap mid-voice
+  updateUiForCurrent();
+  setSerialStatus(`Last card: ${shortUid(uid)} — ${baseLabel}`, "ok");
+}
 
+function applyNamedProfile(key) {
+  const p = PROFILES[key];
+  if (!p) return;
+  activeProfile = { label: `${p.label} (manual)`, L: p.L, R: p.R };
+  engine.applyProfile(activeProfile);
+  updateUiForCurrent();
+}
+
+function setStatus(text, cls) {
+  els.audioStatus.textContent = text;
+  els.audioStatus.className = "status" + (cls ? " " + cls : "");
+}
+function setSerialStatus(text, cls) {
+  els.serialStatus.textContent = text;
+  els.serialStatus.className = "status" + (cls ? " " + cls : "");
+}
+
+const bridgeHandlers = {
+  onStatus: (s) => {
+    if (s === "connected") {
+      els.serialBtn.textContent = "Disconnect reader";
+      setSerialStatus("Reader: waiting for card", "ok");
+    } else {
+      els.serialBtn.textContent = "🔌 Connect card reader";
+      setSerialStatus("Reader: not connected", "warn");
+      serial = null;
+    }
+  },
+  onReady:  () => setSerialStatus("Reader: waiting for card", "ok"),
+  onLogin:  (data) => applyCardAudiogram(data),
+  onError:  (msg)  => setSerialStatus(`Reader: ${msg}`, "err"),
+};
+
+async function toggleSerial() {
+  console.log("[app] connect-reader clicked; supported =", SerialBridge.supported());
+  if (!SerialBridge.supported()) {
+    setSerialStatus("Reader: Web Serial not supported — use Chrome or Edge", "err");
+    return;
+  }
+  if (serial && serial.connected) {
+    await serial.disconnect();
+    return;
+  }
+  serial = new SerialBridge(bridgeHandlers);
+  try {
+    await serial.connect();
+  } catch (e) {
+    const msg = e.message || String(e);
+    const hint = msg.includes("Failed to open")
+      ? "port busy — close Arduino IDE's Serial Monitor, then unplug & replug the Teensy"
+      : msg;
+    setSerialStatus(`Reader: ${hint}`, "warn");
+    serial = null;
+  }
+}
+
+async function tryAutoReconnect() {
+  if (!SerialBridge.supported()) return;
+  try {
+    const ports = await navigator.serial.getPorts();
+    // Only auto-reconnect to a Teensy — avoids silently opening a wrong
+    // USB-serial port that was granted permission during a mis-pick.
+    const teensy = ports.find((p) => {
+      try { return p.getInfo().usbVendorId === 0x16C0; } catch (_) { return false; }
+    });
+    if (!teensy) return;
+    serial = new SerialBridge(bridgeHandlers);
+    await serial.connect(teensy);
+  } catch (e) {
+    console.log("[serial] auto-reconnect failed:", e);
+    serial = null;
+  }
+}
+
+function bindUi() {
   els.pauseBtn.addEventListener("click", async () => {
     if (!engine.ctx) return;
     if (engine.ctx.state === "running") {
@@ -654,78 +679,62 @@ function bindUi() {
     }
   });
 
-  els.stopBtn.addEventListener("click", () => {
-    running = false;
-    engine.stop();
-    stopProgress();
-    els.progressFill.style.width = "0%";
-    els.playBtn.textContent = "▶ Run full demo";
-  });
-
-  document.querySelectorAll("button[data-stage]").forEach((b) => {
-    b.addEventListener("click", async () => {
-      running = false;
-      els.playBtn.textContent = "▶ Run full demo";
-      const idx = parseInt(b.dataset.stage, 10);
-      runStage(idx, { autoAdvance: false });
-    });
-  });
-
   els.speechGain.addEventListener("input", (e) =>
-    engine.setSpeechGain(parseFloat(e.target.value))
-  );
+    engine.setSpeechGain(parseFloat(e.target.value)));
   els.masterGain.addEventListener("input", (e) =>
-    engine.setMasterGain(parseFloat(e.target.value))
-  );
+    engine.setMasterGain(parseFloat(e.target.value)));
 
-  els.loopToggle.addEventListener("change", (e) => {
-    loopEnabled = e.target.checked;
-  });
-
-  // Simulation intensity: live-updates the sensation-level scale. Re-applies
-  // the current profile so the change is audible mid-playback, and redraws
-  // the EQ curve so the viz matches.
   els.simIntensity.addEventListener("input", (e) => {
     SIM.scale = parseFloat(e.target.value);
     els.simIntensityVal.textContent = SIM.scale.toFixed(2);
-    if (stageIdx >= 0) {
-      const profile = PROFILES[STAGES[stageIdx].profile];
-      engine.applyProfile(profile);
-      drawEqCurve(els.eqcurve, profile);
-    } else {
-      drawEqCurve(els.eqcurve, PROFILES.normal);
-    }
+    engine.applyProfile(activeProfile);
+    drawEqCurve(els.eqcurve, activeProfile);
+  });
+
+  els.serialBtn.addEventListener("click", toggleSerial);
+  if (!SerialBridge.supported()) {
+    els.serialBtn.disabled = true;
+    setSerialStatus("Reader: Web Serial not supported — use Chrome or Edge", "warn");
+  }
+
+  document.querySelectorAll("button[data-profile]").forEach((b) => {
+    b.addEventListener("click", () => applyNamedProfile(b.dataset.profile));
   });
 
   window.addEventListener("resize", () => {
-    const profile = stageIdx >= 0 ? PROFILES[STAGES[stageIdx].profile] : PROFILES.normal;
-    drawAudiogram(els.audiogram, profile);
-    drawEqCurve(els.eqcurve, profile);
+    drawAudiogram(els.audiogram, activeProfile);
+    drawEqCurve(els.eqcurve, activeProfile);
   });
 }
 
 async function main() {
-  buildDots();
+  console.log("[app] main starting");
   bindUi();
-  drawAudiogram(els.audiogram, PROFILES.normal);
-  drawEqCurve(els.eqcurve, PROFILES.normal);
+  updateUiForCurrent();
 
   await engine.init();
   setStatus("Loading audio…", "warn");
   const loaded = await engine.loadBuffers();
 
-  const missing = [];
-  if (!loaded.male) missing.push("audio/male.wav");
-  if (!loaded.female) missing.push("audio/female.wav");
-
-  if (missing.length === 0) {
-    setStatus("Audio: male + female ready", "ok");
-  } else {
-    setStatus(
-      `Audio: missing ${missing.join(", ")} — drop WAV files in /audio/ and refresh.`,
-      "warn"
-    );
+  if (!loaded.male && !loaded.female) {
+    setStatus("Both audio files missing — drop WAVs into /audio/.", "err");
+    return;
   }
+
+  const missing = [];
+  if (!loaded.male)   missing.push("male.wav");
+  if (!loaded.female) missing.push("female.wav");
+  setStatus(
+    missing.length
+      ? `Audio: missing ${missing.join(", ")} — looping available voice.`
+      : "Audio: male + female ready",
+    missing.length ? "warn" : "ok"
+  );
+
+  if (!loaded[currentVoice]) currentVoice = loaded.male ? "male" : "female";
+
+  tryAutoReconnect();
+  startPlayback();
 }
 
 main();

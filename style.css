@@ -31,7 +31,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  padding: 28px 40px 12px;
+  padding: 18px 40px 10px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -59,13 +59,13 @@ html, body {
 
 main {
   display: grid;
-  grid-template-columns: 1.15fr 1fr;
+  grid-template-columns: 1fr;
   grid-template-areas:
-    "stage  viz"
-    "ctrl   ctrl"
-    "ex     ex";
-  gap: 20px;
-  padding: 20px 40px 40px;
+    "stage"
+    "viz"
+    "ctrl";
+  gap: 16px;
+  padding: 16px 40px 24px;
   max-width: 1600px;
   margin: 0 auto;
 }
@@ -73,7 +73,6 @@ main {
 .stage-panel  { grid-area: stage; }
 .viz-panel    { grid-area: viz; }
 .controls     { grid-area: ctrl; }
-.explainer    { grid-area: ex; }
 
 .stage-panel,
 .viz-card,
@@ -86,8 +85,8 @@ main {
 }
 
 .viz-panel {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 20px;
   background: transparent;
   border: 0;
@@ -292,6 +291,14 @@ button:disabled {
   color: var(--muted);
   font-size: 13px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.row-label {
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-right: 4px;
 }
 
 .status.ok    { color: var(--green); }
